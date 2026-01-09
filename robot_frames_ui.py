@@ -18,97 +18,23 @@ import pyqtgraph.opengl as gl
 # =========================
 # SE(3) utilities
 # =========================
-
-
-def hat(w: np.ndarray) -> np.ndarray:
-    wx, wy, wz = w
-    return np.array(
-        [
-            [0.0, -wz, wy],
-            [wz, 0.0, -wx],
-            [-wy, wx, 0.0],
-        ],
-        dtype=float,
-    )
-
-
-def rot_axis_angle(axis: np.ndarray, theta: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=float)
-    n = np.linalg.norm(axis)
-    if n < 1e-12:
-        return np.eye(3, dtype=float)
-    a = axis / n
-    K = hat(a)
-    return np.eye(3) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
-
-
-def T_from_Rp(R: np.ndarray, p: np.ndarray) -> np.ndarray:
-    T = np.eye(4, dtype=float)
-    T[:3, :3] = R
-    T[:3, 3] = p
-    return T
-
-
-def project_to_so3(R: np.ndarray) -> np.ndarray:
-    U, _, Vt = np.linalg.svd(R)
-    Rp = U @ Vt
-    if np.linalg.det(Rp) < 0:
-        U[:, -1] *= -1
-        Rp = U @ Vt
-    return Rp
-
-
-def is_valid_transform(T: np.ndarray, tol: float = 5e-3) -> bool:
-    if T.shape != (4, 4):
-        return False
-    if not np.allclose(T[3, :], [0, 0, 0, 1], atol=tol):
-        return False
-    R = T[:3, :3]
-    if not np.allclose(R.T @ R, np.eye(3), atol=tol):
-        return False
-    if not np.isclose(np.linalg.det(R), 1.0, atol=tol):
-        return False
-    return True
-
-
-def origin_of(T: np.ndarray) -> np.ndarray:
-    return T[:3, 3].copy()
-
-
-def axes_of(T: np.ndarray) -> np.ndarray:
-    return T[:3, :3].copy()
+from src.model.kinematics import (
+    hat,
+    rot_axis_angle,
+    T_from_Rp,
+    project_to_so3,
+    is_valid_transform,
+    origin_of,
+    axes_of,
+    rotation_matrix_from_z_to_vec,
+)
+from src.model.elements import Joint, Link, EndEffector, EEType, Element
+from src.model.robot import RobotChain
 
 
 # =========================
 # Mesh / transform helpers
 # =========================
-
-
-def rotation_matrix_from_z_to_vec(v: np.ndarray) -> np.ndarray:
-    """
-    Return R such that R*[0,0,1] aligns with v_hat.
-    """
-    v = np.asarray(v, dtype=float)
-    n = np.linalg.norm(v)
-    if n < 1e-12:
-        return np.eye(3, dtype=float)
-
-    vhat = v / n
-    z = np.array([0.0, 0.0, 1.0], dtype=float)
-    c = float(np.clip(np.dot(z, vhat), -1.0, 1.0))
-
-    if abs(c - 1.0) < 1e-10:
-        return np.eye(3, dtype=float)
-
-    if abs(c + 1.0) < 1e-10:
-        # 180° rotation about X (any axis orthogonal to z is fine)
-        return rot_axis_angle(np.array([1.0, 0.0, 0.0]), math.pi)
-
-    axis = np.cross(z, vhat)
-    s = np.linalg.norm(axis)
-    axis = axis / (s + 1e-12)
-    theta = math.atan2(s, c)
-    return rot_axis_angle(axis, theta)
 
 
 def qmatrix_from_T(T: np.ndarray) -> QtGui.QMatrix4x4:
@@ -200,110 +126,6 @@ def center_meshdata_z(md: gl.MeshData) -> gl.MeshData:
 # =========================
 # Elements: Joint + Link + End Effector
 # =========================
-
-
-@dataclass
-class Joint:
-    name: str
-    joint_type: str  # "revolute" or "prismatic"
-    axis: np.ndarray  # joint-local axis
-    q: float  # ALWAYS stored in radians (for revolute); meters for prismatic
-    q_min: float
-    q_max: float
-    T_mount: np.ndarray  # fixed alignment before the motion (optional)
-
-    def motion_T(self) -> np.ndarray:
-        a = np.asarray(self.axis, dtype=float)
-        if self.joint_type == "revolute":
-            R = rot_axis_angle(a, self.q)
-            return T_from_Rp(R, np.zeros(3))
-        else:
-            a = a / (np.linalg.norm(a) + 1e-12)
-            p = a * self.q
-            return T_from_Rp(np.eye(3), p)
-
-    def local_T(self) -> np.ndarray:
-        return self.T_mount @ self.motion_T()
-
-
-@dataclass
-class Link:
-    name: str
-    T: np.ndarray  # fixed transform
-
-    def local_T(self) -> np.ndarray:
-        return self.T
-
-
-class EEType(str, Enum):
-    FLANGE = "Flange"
-    SUCTION = "Suction"
-    CLAW = "Claw"
-
-
-@dataclass
-class EndEffector:
-    ee_type: EEType = EEType.FLANGE
-    T: np.ndarray = np.eye(4)  # offset from final frame to EE root
-
-
-Element = Union[Joint, Link]
-
-
-class RobotChain:
-    def __init__(self):
-        self.elements: List[Element] = []
-        self.end_effector: Optional[EndEffector] = EndEffector(EEType.FLANGE, np.eye(4))
-
-    def add_revolute_joint(self):
-        jn = sum(isinstance(e, Joint) for e in self.elements) + 1
-        self.elements.append(
-            Joint(
-                name=f"J{jn} (rev)",
-                joint_type="revolute",
-                axis=np.array([0, 0, 1], dtype=float),
-                q=0.0,
-                q_min=-math.pi,
-                q_max=math.pi,
-                T_mount=np.eye(4),
-            )
-        )
-
-    def add_prismatic_joint(self):
-        jn = sum(isinstance(e, Joint) for e in self.elements) + 1
-        self.elements.append(
-            Joint(
-                name=f"J{jn} (pris)",
-                joint_type="prismatic",
-                axis=np.array([0, 0, 1], dtype=float),
-                q=0.0,
-                q_min=-0.3,
-                q_max=0.3,
-                T_mount=np.eye(4),
-            )
-        )
-
-    def add_link(self, dx=0.2, dy=0.0, dz=0.0):
-        ln = sum(isinstance(e, Link) for e in self.elements) + 1
-        T = np.eye(4)
-        T[:3, 3] = np.array([dx, dy, dz], dtype=float)
-        self.elements.append(Link(name=f"L{ln} (link)", T=T))
-
-    def remove(self, idx: int):
-        if 0 <= idx < len(self.elements):
-            self.elements.pop(idx)
-
-    def fk_all(self) -> List[np.ndarray]:
-        """
-        Returns global frames: T0, T1, ..., Tn where n = len(elements).
-        Each element advances one frame.
-        """
-        Ts = [np.eye(4)]
-        T = np.eye(4)
-        for e in self.elements:
-            T = T @ e.local_T()
-            Ts.append(T.copy())
-        return Ts
 
 
 # =========================
