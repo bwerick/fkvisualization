@@ -1,16 +1,12 @@
-#!/usr/bin/env python3
-"""
-Robot Frames Sandbox (Joints + Links + EE + Hybrid + Deg/Rad)
-Python 3.11 compatible (dataclass default_factory fixes, safe QMatrix4x4 builder)
-"""
+import os
 
-from __future__ import annotations
+os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
 
-import math
 import sys
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Union, Tuple
 
 import numpy as np
 
@@ -19,24 +15,12 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
 
-# ============================
-# Math / SE(3) utilities
-# ============================
+# =========================
+# SE(3) utilities
+# =========================
 
 
-def _norm(v: np.ndarray) -> float:
-    return float(np.linalg.norm(v))
-
-
-def unit(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=float).reshape(3)
-    n = _norm(v)
-    if n < 1e-12:
-        return np.array([0.0, 0.0, 1.0], dtype=float)
-    return v / n
-
-
-def skew(w: np.ndarray) -> np.ndarray:
+def hat(w: np.ndarray) -> np.ndarray:
     wx, wy, wz = w
     return np.array(
         [
@@ -49,33 +33,35 @@ def skew(w: np.ndarray) -> np.ndarray:
 
 
 def rot_axis_angle(axis: np.ndarray, theta: float) -> np.ndarray:
-    a = unit(axis)
-    K = skew(a)
-    c = math.cos(theta)
-    s = math.sin(theta)
-    R = np.eye(3, dtype=float) * c + (1 - c) * np.outer(a, a) + s * K
-    return R
+    axis = np.asarray(axis, dtype=float)
+    n = np.linalg.norm(axis)
+    if n < 1e-12:
+        return np.eye(3, dtype=float)
+    a = axis / n
+    K = hat(a)
+    return np.eye(3) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
 
 
 def T_from_Rp(R: np.ndarray, p: np.ndarray) -> np.ndarray:
     T = np.eye(4, dtype=float)
     T[:3, :3] = R
-    T[:3, 3] = np.asarray(p, dtype=float).reshape(3)
+    T[:3, 3] = p
     return T
 
 
-def T_trans(p: np.ndarray) -> np.ndarray:
-    return T_from_Rp(np.eye(3, dtype=float), p)
+def project_to_so3(R: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(R)
+    Rp = U @ Vt
+    if np.linalg.det(Rp) < 0:
+        U[:, -1] *= -1
+        Rp = U @ Vt
+    return Rp
 
 
-def T_rot(axis: np.ndarray, theta: float) -> np.ndarray:
-    return T_from_Rp(rot_axis_angle(axis, theta), np.zeros(3, dtype=float))
-
-
-def se3_valid(T: np.ndarray, tol: float = 1e-4) -> bool:
+def is_valid_transform(T: np.ndarray, tol: float = 5e-3) -> bool:
     if T.shape != (4, 4):
         return False
-    if not np.allclose(T[3, :], np.array([0, 0, 0, 1], dtype=float), atol=tol):
+    if not np.allclose(T[3, :], [0, 0, 0, 1], atol=tol):
         return False
     R = T[:3, :3]
     if not np.allclose(R.T @ R, np.eye(3), atol=tol):
@@ -85,93 +71,111 @@ def se3_valid(T: np.ndarray, tol: float = 1e-4) -> bool:
     return True
 
 
+def origin_of(T: np.ndarray) -> np.ndarray:
+    return T[:3, 3].copy()
+
+
+def axes_of(T: np.ndarray) -> np.ndarray:
+    return T[:3, :3].copy()
+
+
+# =========================
+# Mesh / transform helpers
+# =========================
+
+
 def rotation_matrix_from_z_to_vec(v: np.ndarray) -> np.ndarray:
     """
-    Return R such that R * [0,0,1] aligns with unit(v).
+    Return R such that R*[0,0,1] aligns with v_hat.
     """
-    z = np.array([0.0, 0.0, 1.0], dtype=float)
-    t = unit(v)
-    c = float(np.dot(z, t))
-
-    if c > 1.0 - 1e-10:
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
         return np.eye(3, dtype=float)
-    if c < -1.0 + 1e-10:
-        # 180 deg: rotate around X (or any axis orthogonal to z)
-        return rot_axis_angle(np.array([1.0, 0.0, 0.0], dtype=float), math.pi)
 
-    axis = unit(np.cross(z, t))
-    angle = math.acos(max(-1.0, min(1.0, c)))
-    return rot_axis_angle(axis, angle)
+    vhat = v / n
+    z = np.array([0.0, 0.0, 1.0], dtype=float)
+    c = float(np.clip(np.dot(z, vhat), -1.0, 1.0))
 
+    if abs(c - 1.0) < 1e-10:
+        return np.eye(3, dtype=float)
 
-# ============================
-# Qt transform helper (safe)
-# ============================
+    if abs(c + 1.0) < 1e-10:
+        # 180° rotation about X (any axis orthogonal to z is fine)
+        return rot_axis_angle(np.array([1.0, 0.0, 0.0]), math.pi)
+
+    axis = np.cross(z, vhat)
+    s = np.linalg.norm(axis)
+    axis = axis / (s + 1e-12)
+    theta = math.atan2(s, c)
+    return rot_axis_angle(axis, theta)
 
 
 def qmatrix_from_T(T: np.ndarray) -> QtGui.QMatrix4x4:
     """
-    Safe builder for PySide6 QMatrix4x4 from numpy 4x4.
-    Avoids item assignment (unsupported).
+    Construct QMatrix4x4 from a 4x4 numpy array.
+    (PySide6 binding does not allow M[r,c] assignment.)
     """
-    M = QtGui.QMatrix4x4()
-    # QMatrix4x4 setRow expects QVector4D
-    for r in range(4):
-        M.setRow(
-            r,
-            QtGui.QVector4D(
-                float(T[r, 0]),
-                float(T[r, 1]),
-                float(T[r, 2]),
-                float(T[r, 3]),
-            ),
-        )
-    return M
+    T = np.asarray(T, dtype=float)
+    return QtGui.QMatrix4x4(
+        float(T[0, 0]),
+        float(T[0, 1]),
+        float(T[0, 2]),
+        float(T[0, 3]),
+        float(T[1, 0]),
+        float(T[1, 1]),
+        float(T[1, 2]),
+        float(T[1, 3]),
+        float(T[2, 0]),
+        float(T[2, 1]),
+        float(T[2, 2]),
+        float(T[2, 3]),
+        float(T[3, 0]),
+        float(T[3, 1]),
+        float(T[3, 2]),
+        float(T[3, 3]),
+    )
 
 
-# ============================
-# Mesh builders
-# ============================
-
-
-def meshdata_box(size: Tuple[float, float, float]) -> gl.MeshData:
+def meshdata_box(size=(1.0, 1.0, 1.0)) -> gl.MeshData:
     """
-    Build a box centered at origin with extents size=(sx,sy,sz).
-    Oriented along x,y,z.
+    Create a box aligned to axes with z from 0..sz (so its 'base' is at z=0),
+    matching how we place cylinders (base at p0 then rotate along link direction).
+    size = (sx, sy, sz)
     """
-    sx, sy, sz = size
-    hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
+    sx, sy, sz = map(float, size)
+    x0, x1 = -sx / 2, sx / 2
+    y0, y1 = -sy / 2, sy / 2
+    z0, z1 = 0.0, sz
 
-    # 8 vertices
     verts = np.array(
         [
-            [-hx, -hy, -hz],
-            [hx, -hy, -hz],
-            [hx, hy, -hz],
-            [-hx, hy, -hz],
-            [-hx, -hy, hz],
-            [hx, -hy, hz],
-            [hx, hy, hz],
-            [-hx, hy, hz],
+            [x0, y0, z0],  # 0
+            [x1, y0, z0],  # 1
+            [x1, y1, z0],  # 2
+            [x0, y1, z0],  # 3
+            [x0, y0, z1],  # 4
+            [x1, y0, z1],  # 5
+            [x1, y1, z1],  # 6
+            [x0, y1, z1],  # 7
         ],
         dtype=float,
     )
 
-    # 12 triangles (2 per face)
     faces = np.array(
         [
             [0, 1, 2],
             [0, 2, 3],  # bottom
             [4, 6, 5],
             [4, 7, 6],  # top
-            [0, 4, 5],
-            [0, 5, 1],  # -y
+            [0, 5, 1],
+            [0, 4, 5],  # front
+            [3, 2, 6],
+            [3, 6, 7],  # back
+            [0, 3, 7],
+            [0, 7, 4],  # left
             [1, 5, 6],
-            [1, 6, 2],  # +x
-            [2, 6, 7],
-            [2, 7, 3],  # +y
-            [3, 7, 4],
-            [3, 4, 0],  # -x
+            [1, 6, 2],  # right
         ],
         dtype=int,
     )
@@ -179,428 +183,739 @@ def meshdata_box(size: Tuple[float, float, float]) -> gl.MeshData:
     return gl.MeshData(vertexes=verts, faces=faces)
 
 
-def meshdata_cylinder(radius: float, length: float, segments: int = 24) -> gl.MeshData:
+def center_meshdata_z(md: gl.MeshData) -> gl.MeshData:
     """
-    Cylinder centered at origin, axis along +Z, length 'length'.
+    Centers any mesh along its local Z axis by shifting vertices so that
+    z-range becomes symmetric around 0.
+    Works across pyqtgraph versions (some primitives are centered, some are not).
     """
-    r = float(radius)
-    L = float(length)
-    hz = L / 2.0
-
-    # circle points
-    angles = np.linspace(0, 2 * math.pi, segments, endpoint=False)
-    circle = np.stack([r * np.cos(angles), r * np.sin(angles)], axis=1)
-
-    # vertices: bottom ring + top ring + centers
-    bottom = np.column_stack([circle, np.full((segments,), -hz)])
-    top = np.column_stack([circle, np.full((segments,), +hz)])
-    v_center_bottom = np.array([[0.0, 0.0, -hz]])
-    v_center_top = np.array([[0.0, 0.0, +hz]])
-
-    verts = np.vstack([bottom, top, v_center_bottom, v_center_top])
-    idx_center_bottom = 2 * segments
-    idx_center_top = 2 * segments + 1
-
-    faces = []
-
-    # side faces
-    for i in range(segments):
-        j = (i + 1) % segments
-        # quad split into 2 tris
-        faces.append([i, j, segments + j])
-        faces.append([i, segments + j, segments + i])
-
-    # bottom cap
-    for i in range(segments):
-        j = (i + 1) % segments
-        faces.append([idx_center_bottom, j, i])
-
-    # top cap
-    for i in range(segments):
-        j = (i + 1) % segments
-        faces.append([idx_center_top, segments + i, segments + j])
-
-    return gl.MeshData(vertexes=verts, faces=np.array(faces, dtype=int))
+    v = md.vertexes().copy()
+    zmin = float(v[:, 2].min())
+    zmax = float(v[:, 2].max())
+    zc = 0.5 * (zmin + zmax)
+    v[:, 2] -= zc
+    return gl.MeshData(vertexes=v, faces=md.faces())
 
 
-# ============================
-# Model
-# ============================
-
-
-class JointType(str, Enum):
-    REVOLUTE = "revolute"
-    PRISMATIC = "prismatic"
+# =========================
+# Elements: Joint + Link + End Effector
+# =========================
 
 
 @dataclass
-class Element:
+class Joint:
     name: str
+    joint_type: str  # "revolute" or "prismatic"
+    axis: np.ndarray  # joint-local axis
+    q: float  # ALWAYS stored in radians (for revolute); meters for prismatic
+    q_min: float
+    q_max: float
+    T_mount: np.ndarray  # fixed alignment before the motion (optional)
 
-    def local_T(self) -> np.ndarray:
-        return np.eye(4, dtype=float)
-
-
-@dataclass
-class Joint(Element):
-    jtype: JointType = JointType.REVOLUTE
-    axis: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.0, 1.0], dtype=float)
-    )
-    q: float = 0.0  # radians for revolute, meters for prismatic (internal)
-    # fixed mount alignment before joint motion
-    T_mount: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=float))
-
-    def local_T(self) -> np.ndarray:
-        a = unit(self.axis)
-        if self.jtype == JointType.REVOLUTE:
-            return self.T_mount @ T_rot(a, self.q)
+    def motion_T(self) -> np.ndarray:
+        a = np.asarray(self.axis, dtype=float)
+        if self.joint_type == "revolute":
+            R = rot_axis_angle(a, self.q)
+            return T_from_Rp(R, np.zeros(3))
         else:
-            return self.T_mount @ T_trans(a * float(self.q))
+            a = a / (np.linalg.norm(a) + 1e-12)
+            p = a * self.q
+            return T_from_Rp(np.eye(3), p)
+
+    def local_T(self) -> np.ndarray:
+        return self.T_mount @ self.motion_T()
 
 
 @dataclass
-class Link(Element):
-    dx: float = 0.2
-    dy: float = 0.0
-    dz: float = 0.0
+class Link:
+    name: str
+    T: np.ndarray  # fixed transform
 
     def local_T(self) -> np.ndarray:
-        return T_trans(np.array([self.dx, self.dy, self.dz], dtype=float))
+        return self.T
 
 
-class EndEffectorType(str, Enum):
-    NONE = "None"
+class EEType(str, Enum):
     FLANGE = "Flange"
     SUCTION = "Suction"
     CLAW = "Claw"
 
 
 @dataclass
-class RobotModel:
-    elements: List[Element] = field(default_factory=list)
-    ee_type: EndEffectorType = EndEffectorType.NONE
+class EndEffector:
+    ee_type: EEType = EEType.FLANGE
+    T: np.ndarray = np.eye(4)  # offset from final frame to EE root
 
-    def add_revolute(self, axis=(0, 0, 1)):
-        n = sum(isinstance(e, Joint) for e in self.elements) + 1
+
+Element = Union[Joint, Link]
+
+
+class RobotChain:
+    def __init__(self):
+        self.elements: List[Element] = []
+        self.end_effector: Optional[EndEffector] = EndEffector(EEType.FLANGE, np.eye(4))
+
+    def add_revolute_joint(self):
+        jn = sum(isinstance(e, Joint) for e in self.elements) + 1
         self.elements.append(
             Joint(
-                name=f"J{n} (rev)",
-                jtype=JointType.REVOLUTE,
-                axis=np.array(axis, dtype=float),
+                name=f"J{jn} (rev)",
+                joint_type="revolute",
+                axis=np.array([0, 0, 1], dtype=float),
+                q=0.0,
+                q_min=-math.pi,
+                q_max=math.pi,
+                T_mount=np.eye(4),
             )
         )
 
-    def add_prismatic(self, axis=(0, 0, 1)):
-        n = sum(isinstance(e, Joint) for e in self.elements) + 1
+    def add_prismatic_joint(self):
+        jn = sum(isinstance(e, Joint) for e in self.elements) + 1
         self.elements.append(
             Joint(
-                name=f"J{n} (pris)",
-                jtype=JointType.PRISMATIC,
-                axis=np.array(axis, dtype=float),
+                name=f"J{jn} (pris)",
+                joint_type="prismatic",
+                axis=np.array([0, 0, 1], dtype=float),
+                q=0.0,
+                q_min=-0.3,
+                q_max=0.3,
+                T_mount=np.eye(4),
             )
         )
 
     def add_link(self, dx=0.2, dy=0.0, dz=0.0):
-        n = sum(isinstance(e, Link) for e in self.elements) + 1
-        self.elements.append(Link(name=f"L{n} (link)", dx=dx, dy=dy, dz=dz))
+        ln = sum(isinstance(e, Link) for e in self.elements) + 1
+        T = np.eye(4)
+        T[:3, 3] = np.array([dx, dy, dz], dtype=float)
+        self.elements.append(Link(name=f"L{ln} (link)", T=T))
 
-    def remove_at(self, idx: int):
+    def remove(self, idx: int):
         if 0 <= idx < len(self.elements):
             self.elements.pop(idx)
 
-    def fk_frames(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    def fk_all(self) -> List[np.ndarray]:
         """
-        Returns:
-          - Ts_global_frames: list of frame poses (frame 0, frame 1, ... frame N)
-          - Ts_step: list of step transforms (0H1,1H2,...), same length as elements
-        Convention: each element advances frame i -> i+1
+        Returns global frames: T0, T1, ..., Tn where n = len(elements).
+        Each element advances one frame.
         """
-        Ts_frames = [np.eye(4, dtype=float)]
-        Ts_step = []
-        T = np.eye(4, dtype=float)
+        Ts = [np.eye(4)]
+        T = np.eye(4)
         for e in self.elements:
-            A = e.local_T()
-            Ts_step.append(A)
-            T = T @ A
-            Ts_frames.append(T.copy())
-        return Ts_frames, Ts_step
+            T = T @ e.local_T()
+            Ts.append(T.copy())
+        return Ts
 
 
-# ============================
-# Transform viewer window
-# ============================
+# =========================
+# UI widgets
+# =========================
 
 
-class TransformViewMode(str, Enum):
-    NUMERIC = "Numeric"
-    HYBRID = "Hybrid"
+class MatrixEditor(QtWidgets.QTableWidget):
+    matrixChanged = QtCore.Signal(np.ndarray)
 
-
-class FrameTransformsWindow(QtWidgets.QMainWindow):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Frame Transforms")
+        super().__init__(4, 4)
+        self._block = False
+        self.itemChanged.connect(self._on_change)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.set_matrix(np.eye(4))
 
-        self._mode = TransformViewMode.NUMERIC
+    def set_matrix(self, T: np.ndarray):
+        self._block = True
+        for r in range(4):
+            for c in range(4):
+                item = self.item(r, c)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    self.setItem(r, c, item)
+                item.setText(f"{float(T[r, c]): .6f}")
+        self._block = False
+
+    def matrix(self) -> Optional[np.ndarray]:
+        T = np.zeros((4, 4), dtype=float)
+        for r in range(4):
+            for c in range(4):
+                item = self.item(r, c)
+                if item is None:
+                    return None
+                txt = item.text().strip()
+                try:
+                    T[r, c] = float(txt)
+                except ValueError:
+                    return None
+        return T
+
+    def _on_change(self, _):
+        if self._block:
+            return
+        T = self.matrix()
+        if T is not None:
+            self.matrixChanged.emit(T)
+
+
+def _axis_basis_name(a: np.ndarray, tol: float = 1e-6) -> Optional[str]:
+    a = np.asarray(a, dtype=float)
+    n = float(np.linalg.norm(a))
+    if n < 1e-12:
+        return None
+    ah = a / n
+    if np.allclose(ah, [1, 0, 0], atol=tol):
+        return "X"
+    if np.allclose(ah, [0, 1, 0], atol=tol):
+        return "Y"
+    if np.allclose(ah, [0, 0, 1], atol=tol):
+        return "Z"
+    # also allow negative basis as same axis (rotation direction is sign-sensitive,
+    # but for learning display it's often okay to show it explicitly)
+    if np.allclose(ah, [-1, 0, 0], atol=tol):
+        return "-X"
+    if np.allclose(ah, [0, -1, 0], atol=tol):
+        return "-Y"
+    if np.allclose(ah, [0, 0, -1], atol=tol):
+        return "-Z"
+    return None
+
+
+class MatricesWindow(QtWidgets.QMainWindow):
+    """
+    Tabbed window:
+      - Numeric: local transforms iH(i+1) and global transforms 0Hk (tables)
+      - Hybrid: formulas + live values (monospace text)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Frame Transforms")
+        self.resize(660, 820)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
+        outer = QtWidgets.QVBoxLayout(central)
 
-        # mode buttons
-        btn_row = QtWidgets.QHBoxLayout()
-        self.btn_numeric = QtWidgets.QPushButton("Numeric")
-        self.btn_hybrid = QtWidgets.QPushButton("Hybrid")
-        self.btn_numeric.setCheckable(True)
-        self.btn_hybrid.setCheckable(True)
-        self.btn_numeric.setChecked(True)
-        self.btn_group = QtWidgets.QButtonGroup(self)
-        self.btn_group.addButton(self.btn_numeric)
-        self.btn_group.addButton(self.btn_hybrid)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_numeric)
-        btn_row.addWidget(self.btn_hybrid)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
+        self.tabs = QtWidgets.QTabWidget()
+        outer.addWidget(self.tabs)
 
-        self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        layout.addWidget(self.scroll)
+        # -------- Numeric tab
+        self.num_scroll = QtWidgets.QScrollArea()
+        self.num_scroll.setWidgetResizable(True)
+        self.tabs.addTab(self.num_scroll, "Numeric")
 
-        self.inner = QtWidgets.QWidget()
-        self.scroll.setWidget(self.inner)
-        self.inner_layout = QtWidgets.QVBoxLayout(self.inner)
-        self.inner_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.num_inner = QtWidgets.QWidget()
+        self.num_scroll.setWidget(self.num_inner)
+        self.num_vbox = QtWidgets.QVBoxLayout(self.num_inner)
+        self.num_vbox.setSpacing(10)
 
-        self.btn_numeric.clicked.connect(
-            lambda: self.set_mode(TransformViewMode.NUMERIC)
+        self._local_items: List[Tuple[QtWidgets.QLabel, QtWidgets.QTableWidget]] = []
+        self._global_items: List[Tuple[QtWidgets.QLabel, QtWidgets.QTableWidget]] = []
+
+        # -------- Hybrid tab (tables)
+        self.hy_scroll = QtWidgets.QScrollArea()
+        self.hy_scroll.setWidgetResizable(True)
+        self.tabs.addTab(self.hy_scroll, "Hybrid")
+
+        self.hy_inner = QtWidgets.QWidget()
+        self.hy_scroll.setWidget(self.hy_inner)
+        self.hy_vbox = QtWidgets.QVBoxLayout(self.hy_inner)
+        self.hy_vbox.setSpacing(10)
+
+        self._hy_items: List[Tuple[QtWidgets.QLabel, QtWidgets.QTableWidget]] = []
+        self.hy_hdr = QtWidgets.QLabel(
+            "Hybrid matrices: symbol (top) + live value (bottom)"
         )
-        self.btn_hybrid.clicked.connect(lambda: self.set_mode(TransformViewMode.HYBRID))
+        self.hy_hdr.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.hy_vbox.addWidget(self.hy_hdr)
 
-        self._blocks: List[QtWidgets.QWidget] = []
+    def _make_hybrid_table(self) -> QtWidgets.QTableWidget:
+        t = QtWidgets.QTableWidget(4, 4)
+        t.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        t.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        t.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        t.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        t.setFixedHeight(190)  # taller for 2-line cells
 
-    def set_mode(self, mode: TransformViewMode):
-        self._mode = mode
-        self.btn_numeric.setChecked(mode == TransformViewMode.NUMERIC)
-        self.btn_hybrid.setChecked(mode == TransformViewMode.HYBRID)
+        font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        t.setFont(font)
 
-    def clear_blocks(self):
-        for w in self._blocks:
-            w.setParent(None)
-        self._blocks.clear()
+        for r in range(4):
+            for c in range(4):
+                it = QtWidgets.QTableWidgetItem("")
+                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                t.setItem(r, c, it)
+        return t
 
-    def update_from_robot(self, robot: RobotModel, angle_units_deg: bool):
-        self.clear_blocks()
-        Ts_frames, Ts_step = robot.fk_frames()
+    def _set_hybrid_cell(
+        self, table: QtWidgets.QTableWidget, r: int, c: int, expr: str, val: float
+    ):
+        table.item(r, c).setText(f"{expr}\n{val: .6f}")
 
-        # For hybrid we show "symbol" row + numeric row
-        # (We won't do true sympy; we'll show c/s tokens as strings.)
+    def _clear_hybrid(self):
+        # remove old hybrid widgets except header
+        while self.hy_vbox.count() > 1:
+            item = self.hy_vbox.takeAt(1)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._hy_items.clear()
 
-        for i, e in enumerate(robot.elements):
-            title = f"{i}H{i+1}  ({e.name})"
-            header = QtWidgets.QLabel(title)
-            header.setStyleSheet("font-size: 18px; font-weight: 600; padding: 8px 0;")
-            self.inner_layout.addWidget(header)
+    def _axis_is_basis(self, axis: np.ndarray, tol: float = 1e-6) -> Optional[str]:
+        a = np.asarray(axis, dtype=float)
+        n = float(np.linalg.norm(a))
+        if n < 1e-12:
+            return None
+        a = a / n
+        if np.allclose(a, [1, 0, 0], atol=tol):
+            return "X"
+        if np.allclose(a, [0, 1, 0], atol=tol):
+            return "Y"
+        if np.allclose(a, [0, 0, 1], atol=tol):
+            return "Z"
+        if np.allclose(a, [-1, 0, 0], atol=tol):
+            return "-X"
+        if np.allclose(a, [0, -1, 0], atol=tol):
+            return "-Y"
+        if np.allclose(a, [0, 0, -1], atol=tol):
+            return "-Z"
+        return None
 
-            # info line
-            info = QtWidgets.QLabel()
-            info.setStyleSheet("font-family: monospace; padding-bottom: 6px;")
-            if isinstance(e, Joint):
-                axis = unit(e.axis)
-                axis_name = (
-                    "X"
-                    if np.allclose(axis, [1, 0, 0])
-                    else (
-                        "Y"
-                        if np.allclose(axis, [0, 1, 0])
-                        else (
-                            "Z"
-                            if np.allclose(axis, [0, 0, 1])
-                            else f"[{axis[0]:.2f},{axis[1]:.2f},{axis[2]:.2f}]"
+    def _format_theta_live(self, q_rad: float, angle_unit: str) -> str:
+        if angle_unit == "deg":
+            return f"{math.degrees(q_rad):.3f}° ({q_rad:.5f} rad)"
+        return f"{q_rad:.5f} rad"
+
+    def _make_table(self) -> QtWidgets.QTableWidget:
+        t = QtWidgets.QTableWidget(4, 4)
+        t.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        t.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        t.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        t.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        t.setFixedHeight(140)
+        for r in range(4):
+            for c in range(4):
+                it = QtWidgets.QTableWidgetItem("0.000000")
+                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                t.setItem(r, c, it)
+        return t
+
+    def _set_table(self, table: QtWidgets.QTableWidget, T: np.ndarray):
+        for r in range(4):
+            for c in range(4):
+                table.item(r, c).setText(f"{float(T[r,c]): .6f}")
+
+    def _clear_numeric(self):
+        while self.num_vbox.count():
+            item = self.num_vbox.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._local_items.clear()
+        self._global_items.clear()
+
+    def set_transforms(
+        self,
+        elements: List[Element],
+        locals_list: List[np.ndarray],
+        globals_list: List[np.ndarray],
+        angle_unit: str,  # "rad" or "deg"
+    ):
+        n = len(locals_list)
+
+        # ---------- Numeric rebuild if counts changed
+        if len(self._local_items) != n or len(self._global_items) != len(globals_list):
+            self._clear_numeric()
+
+            hdr1 = QtWidgets.QLabel("Local transforms (iH(i+1))")
+            hdr1.setStyleSheet("font-weight: bold; font-size: 14px;")
+            self.num_vbox.addWidget(hdr1)
+
+            for i in range(n):
+                lbl = QtWidgets.QLabel(f"{i}H{i+1}")
+                lbl.setStyleSheet("font-weight: bold;")
+                table = self._make_table()
+                self.num_vbox.addWidget(lbl)
+                self.num_vbox.addWidget(table)
+                self._local_items.append((lbl, table))
+
+            hdr2 = QtWidgets.QLabel("Global transforms (0Hk)")
+            hdr2.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 12px;")
+            self.num_vbox.addWidget(hdr2)
+
+            for k in range(len(globals_list)):
+                lbl = QtWidgets.QLabel(f"0H{k}")
+                lbl.setStyleSheet("font-weight: bold;")
+                table = self._make_table()
+                self.num_vbox.addWidget(lbl)
+                self.num_vbox.addWidget(table)
+                self._global_items.append((lbl, table))
+
+            self.num_vbox.addStretch(1)
+
+        # ---------- Numeric update
+        for i, Tl in enumerate(locals_list):
+            self._set_table(self._local_items[i][1], Tl)
+        for k, Tg in enumerate(globals_list):
+            self._set_table(self._global_items[k][1], Tg)
+
+        # ---------- Hybrid update (formulas + live values)
+        self._set_hybrid_tables(elements, locals_list, angle_unit)
+
+    def _set_hybrid_tables(
+        self, elements: List[Element], locals_list: List[np.ndarray], angle_unit: str
+    ):
+        # rebuild if needed
+        if len(self._hy_items) != len(locals_list):
+            self._clear_hybrid()
+            for i in range(len(locals_list)):
+                lbl = QtWidgets.QLabel(f"{i}H{i+1}  ({elements[i].name})")
+                lbl.setStyleSheet("font-weight: bold;")
+                tab = self._make_hybrid_table()
+                self.hy_vbox.addWidget(lbl)
+                self.hy_vbox.addWidget(tab)
+                self._hy_items.append((lbl, tab))
+            self.hy_vbox.addStretch(1)
+
+        # fill each 4x4 with expr + value
+        rev_k = 0
+        pri_k = 0
+
+        for i, e in enumerate(elements):
+            T = locals_list[i]
+            table = self._hy_items[i][1]
+
+            # default: numeric only
+            def fill_numeric_only():
+                for r in range(4):
+                    for c in range(4):
+                        self._set_hybrid_cell(table, r, c, " ", float(T[r, c]))
+
+            if isinstance(e, Link):
+                # Hybrid: show translation symbols for last column (top), numeric below
+                dx, dy, dz = float(T[0, 3]), float(T[1, 3]), float(T[2, 3])
+                # rotation part
+                for r in range(3):
+                    for c in range(3):
+                        expr = (
+                            "1"
+                            if (r == c and abs(T[r, c] - 1.0) < 1e-9)
+                            else ("0" if abs(T[r, c]) < 1e-9 else "R")
                         )
-                    )
-                )
-                if e.jtype == JointType.REVOLUTE:
-                    th = e.q
-                    th_deg = math.degrees(th)
-                    shown = th_deg if angle_units_deg else th
-                    unit_str = "deg" if angle_units_deg else "rad"
-                    c = math.cos(th)
-                    s = math.sin(th)
-                    info.setText(
-                        f"JOINT revolute | axis={axis_name} | θ={shown:.5f} {unit_str} | c={c:.6f} s={s:.6f}"
-                    )
+                        self._set_hybrid_cell(table, r, c, expr, float(T[r, c]))
+                self._set_hybrid_cell(table, 0, 3, "dx", dx)
+                self._set_hybrid_cell(table, 1, 3, "dy", dy)
+                self._set_hybrid_cell(table, 2, 3, "dz", dz)
+                # last row
+                self._set_hybrid_cell(table, 3, 0, "0", 0.0)
+                self._set_hybrid_cell(table, 3, 1, "0", 0.0)
+                self._set_hybrid_cell(table, 3, 2, "0", 0.0)
+                self._set_hybrid_cell(table, 3, 3, "1", 1.0)
+                continue
+
+            # Joint
+            if e.joint_type == "revolute":
+                rev_k += 1
+                sym = f"θ{rev_k}"
+                q = float(e.q)
+                ax = self._axis_is_basis(e.axis)
+
+                # handle negative axes as sign flip on theta
+                theta_sym = sym
+                theta_val = q
+                if ax and ax.startswith("-"):
+                    theta_sym = f"-{sym}"
+                    theta_val = -q
+                    ax = ax[1:]
+
+                c = math.cos(theta_val)
+                s = math.sin(theta_val)
+
+                # Build symbolic templates for Rx/Ry/Rz only
+                if ax == "Z":
+                    exprM = [
+                        ["c" + str(rev_k), "-s" + str(rev_k), "0", "0"],
+                        ["s" + str(rev_k), "c" + str(rev_k), "0", "0"],
+                        ["0", "0", "1", "0"],
+                        ["0", "0", "0", "1"],
+                    ]
+                    valM = [
+                        [c, -s, 0, 0],
+                        [s, c, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ]
+                elif ax == "Y":
+                    exprM = [
+                        ["c" + str(rev_k), "0", "s" + str(rev_k), "0"],
+                        ["0", "1", "0", "0"],
+                        ["-s" + str(rev_k), "0", "c" + str(rev_k), "0"],
+                        ["0", "0", "0", "1"],
+                    ]
+                    valM = [
+                        [c, 0, s, 0],
+                        [0, 1, 0, 0],
+                        [-s, 0, c, 0],
+                        [0, 0, 0, 1],
+                    ]
+                elif ax == "X":
+                    exprM = [
+                        ["1", "0", "0", "0"],
+                        ["0", "c" + str(rev_k), "-s" + str(rev_k), "0"],
+                        ["0", "s" + str(rev_k), "c" + str(rev_k), "0"],
+                        ["0", "0", "0", "1"],
+                    ]
+                    valM = [
+                        [1, 0, 0, 0],
+                        [0, c, -s, 0],
+                        [0, s, c, 0],
+                        [0, 0, 0, 1],
+                    ]
                 else:
-                    q = float(e.q)
-                    info.setText(f"JOINT prismatic | axis={axis_name} | q={q:.5f} m")
-            else:
-                link = e  # type: ignore
-                info.setText(
-                    f"LINK fixed | translation=[{link.dx:.3f},{link.dy:.3f},{link.dz:.3f}] m"
+                    # custom axis: numeric-only in matrix cells (still tabular)
+                    fill_numeric_only()
+                    # update header with live theta info
+                    self._hy_items[i][0].setText(
+                        f"{i}H{i+1}  ({e.name})   axis=custom   {sym}={self._format_theta_live(q, angle_unit)}"
+                    )
+                    continue
+
+                # fill
+                for r in range(4):
+                    for c2 in range(4):
+                        self._set_hybrid_cell(
+                            table, r, c2, exprM[r][c2], float(valM[r][c2])
+                        )
+
+                # update header with live angle
+                self._hy_items[i][0].setText(
+                    f"{i}H{i+1}  ({e.name})   {ax}   {sym}={self._format_theta_live(q, angle_unit)}   c{rev_k}={c:.6f} s{rev_k}={s:.6f}"
                 )
-            self.inner_layout.addWidget(info)
+                continue
 
-            A = Ts_step[i]
+            else:
+                # prismatic
+                pri_k += 1
+                sym = f"d{pri_k}"
+                d = float(e.q)
+                ax = self._axis_is_basis(e.axis)
 
-            table = self._matrix_table(A, e, angle_units_deg)
-            self.inner_layout.addWidget(table)
+                # For basis axes, show symbol in translation component
+                if ax in ("X", "Y", "Z", "-X", "-Y", "-Z"):
+                    # use sign for -axis
+                    sign = -1.0 if ax.startswith("-") else 1.0
+                    base = ax[1:] if ax.startswith("-") else ax
 
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-            sep.setStyleSheet("color: #444;")
-            self.inner_layout.addWidget(sep)
+                    # rotation is identity for pure prismatic motion
+                    for r in range(3):
+                        for c2 in range(3):
+                            self._set_hybrid_cell(
+                                table, r, c2, "1" if r == c2 else "0", float(T[r, c2])
+                            )
 
-        self.inner_layout.addStretch(1)
+                    # translation
+                    expr_dx, expr_dy, expr_dz = "0", "0", "0"
+                    val_dx, val_dy, val_dz = 0.0, 0.0, 0.0
+                    if base == "X":
+                        expr_dx = f"{sym}" if sign > 0 else f"-{sym}"
+                        val_dx = d
+                    elif base == "Y":
+                        expr_dy = f"{sym}" if sign > 0 else f"-{sym}"
+                        val_dy = d
+                    else:
+                        expr_dz = f"{sym}" if sign > 0 else f"-{sym}"
+                        val_dz = d
 
-    def _matrix_table(
-        self, A: np.ndarray, e: Element, angle_units_deg: bool
-    ) -> QtWidgets.QWidget:
-        container = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(container)
+                    self._set_hybrid_cell(table, 0, 3, expr_dx, float(T[0, 3]))
+                    self._set_hybrid_cell(table, 1, 3, expr_dy, float(T[1, 3]))
+                    self._set_hybrid_cell(table, 2, 3, expr_dz, float(T[2, 3]))
 
-        if self._mode == TransformViewMode.NUMERIC:
-            tbl = self._make_tbl(A, None)
-            v.addWidget(tbl)
-        else:
-            # Hybrid: top row "symbolic-ish", bottom numeric
-            sym = self._symbolic_matrix(A, e, angle_units_deg)
-            tbl = self._make_tbl(A, sym)
-            v.addWidget(tbl)
+                    # last row
+                    self._set_hybrid_cell(table, 3, 0, "0", 0.0)
+                    self._set_hybrid_cell(table, 3, 1, "0", 0.0)
+                    self._set_hybrid_cell(table, 3, 2, "0", 0.0)
+                    self._set_hybrid_cell(table, 3, 3, "1", 1.0)
 
-        self._blocks.append(container)
-        return container
+                    self._hy_items[i][0].setText(
+                        f"{i}H{i+1}  ({e.name})   {ax}   {sym}={d:.5f} m"
+                    )
+                    continue
 
-    def _make_tbl(
-        self, A: np.ndarray, sym: Optional[List[List[str]]]
-    ) -> QtWidgets.QTableWidget:
-        rows = 4 if sym is None else 8
-        tbl = QtWidgets.QTableWidget(rows, 4)
-        tbl.setStyleSheet("font-family: monospace; font-size: 14px;")
-        tbl.verticalHeader().setVisible(False)
-        tbl.horizontalHeader().setVisible(False)
-        tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        tbl.setShowGrid(True)
+                # custom axis -> numeric-only table
+                fill_numeric_only()
+                self._hy_items[i][0].setText(
+                    f"{i}H{i+1}  ({e.name})   axis=custom   d={d:.5f} m"
+                )
 
-        def set_cell(r, c, text):
-            it = QtWidgets.QTableWidgetItem(text)
-            it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            tbl.setItem(r, c, it)
+    def _build_hybrid_text(self, elements: List[Element], angle_unit: str) -> str:
+        """
+        Hybrid view:
+          - show function form (Rx/Ry/Rz if axis aligned; otherwise R(â,θ))
+          - show live values (degrees + radians when in degrees mode)
+          - show c/s values for revolute basis axes
+        """
+        # assign symbols per joint
+        rev_count = 0
+        pri_count = 0
 
-        if sym is not None:
-            for r in range(4):
-                for c in range(4):
-                    set_cell(r, c, sym[r][c])
-            for r in range(4):
-                for c in range(4):
-                    set_cell(r + 4, c, f"{A[r, c]: .6f}")
-        else:
-            for r in range(4):
-                for c in range(4):
-                    set_cell(r, c, f"{A[r, c]: .6f}")
+        lines: List[str] = []
+        lines.append("HYBRID VIEW (structure + live values)")
+        lines.append(
+            "Internals: revolute q stored in radians; prismatic q stored in meters."
+        )
+        lines.append("")
 
-        tbl.resizeColumnsToContents()
-        tbl.resizeRowsToContents()
-        tbl.setMinimumHeight(180 if sym is None else 300)
-        return tbl
+        for i, e in enumerate(elements):
+            label = f"{i}H{i+1}"
+            lines.append("=" * 70)
+            lines.append(f"{label}   ({e.name})")
 
-    def _symbolic_matrix(
-        self, A: np.ndarray, e: Element, angle_units_deg: bool
-    ) -> List[List[str]]:
-        # Just a friendly symbolic-ish presentation
-        if isinstance(e, Joint) and e.jtype == JointType.REVOLUTE:
-            axis = unit(e.axis)
-            # detect axis
-            if np.allclose(axis, [0, 0, 1]):
-                return [
-                    ["c", "-s", "0", "0"],
-                    ["s", "c", "0", "0"],
-                    ["0", "0", "1", "0"],
-                    ["0", "0", "0", "1"],
-                ]
-            if np.allclose(axis, [1, 0, 0]):
-                return [
-                    ["1", "0", "0", "0"],
-                    ["0", "c", "-s", "0"],
-                    ["0", "s", "c", "0"],
-                    ["0", "0", "0", "1"],
-                ]
-            if np.allclose(axis, [0, 1, 0]):
-                return [
-                    ["c", "0", "s", "0"],
-                    ["0", "1", "0", "0"],
-                    ["-s", "0", "c", "0"],
-                    ["0", "0", "0", "1"],
-                ]
-        if isinstance(e, Joint) and e.jtype == JointType.PRISMATIC:
-            return [
-                ["1", "0", "0", "q*ax"],
-                ["0", "1", "0", "q*ay"],
-                ["0", "0", "1", "q*az"],
-                ["0", "0", "0", "1"],
-            ]
-        if isinstance(e, Link):
-            return [
-                ["1", "0", "0", "dx"],
-                ["0", "1", "0", "dy"],
-                ["0", "0", "1", "dz"],
-                ["0", "0", "0", "1"],
-            ]
-        # fallback
-        return [[f"{A[r,c]:.3f}" for c in range(4)] for r in range(4)]
+            if isinstance(e, Link):
+                T = e.T
+                dx, dy, dz = T[0, 3], T[1, 3], T[2, 3]
+                lines.append("Type: LINK (fixed)")
+                lines.append("Form:  T_link")
+                lines.append(
+                    f"Live:  translation = [dx,dy,dz] = [{dx:.4f}, {dy:.4f}, {dz:.4f}]"
+                )
+                lines.append("")
 
+            else:
+                if e.joint_type == "revolute":
+                    rev_count += 1
+                    sym = f"θ{rev_count}"
+                    q_rad = float(e.q)
 
-# ============================
-# 3D View
-# ============================
+                    if angle_unit == "deg":
+                        q_deg = math.degrees(q_rad)
+                        q_str = f"{q_deg:.3f}° ({q_rad:.5f} rad)"
+                    else:
+                        q_str = f"{q_rad:.5f} rad"
+
+                    axname = _axis_basis_name(e.axis)
+                    lines.append("Type: JOINT (revolute)")
+                    lines.append("Form:  T_mount · R(axis, θ)")
+                    lines.append(f"Live:  {sym} = {q_str}")
+
+                    if axname in ("X", "Y", "Z", "-X", "-Y", "-Z"):
+                        # show nice Rx/Ry/Rz
+                        if axname == "X":
+                            Rform = f"Rx({sym})"
+                        elif axname == "Y":
+                            Rform = f"Ry({sym})"
+                        elif axname == "Z":
+                            Rform = f"Rz({sym})"
+                        else:
+                            # negative axis
+                            base = axname[1:]
+                            Rform = f"R{base}(-{sym})  (since axis = {axname})"
+                        lines.append(f"Axis:  {axname}")
+                        lines.append(f"Rot:   {Rform}")
+
+                        # trig aliases
+                        c = math.cos(q_rad)
+                        s = math.sin(q_rad)
+                        lines.append(
+                            f"Trig:  c{rev_count}=cos({sym})={c:.6f}   s{rev_count}=sin({sym})={s:.6f}"
+                        )
+                    else:
+                        a = np.asarray(e.axis, dtype=float)
+                        n = float(np.linalg.norm(a))
+                        if n < 1e-12:
+                            ah = np.array([0.0, 0.0, 0.0])
+                        else:
+                            ah = a / n
+                        lines.append(
+                            f"Axis:  â = [{ah[0]:.4f}, {ah[1]:.4f}, {ah[2]:.4f}]"
+                        )
+                        lines.append(f"Rot:   R(â, {sym})  (Rodrigues axis-angle)")
+
+                    lines.append("")
+
+                else:
+                    pri_count += 1
+                    sym = f"d{pri_count}"
+                    d = float(e.q)
+                    lines.append("Type: JOINT (prismatic)")
+                    lines.append("Form:  T_mount · T(axis · d)")
+                    lines.append(f"Live:  {sym} = {d:.5f} m")
+
+                    axname = _axis_basis_name(e.axis)
+                    if axname in ("X", "Y", "Z", "-X", "-Y", "-Z"):
+                        if axname == "X":
+                            Tform = f"Tx({sym})"
+                        elif axname == "Y":
+                            Tform = f"Ty({sym})"
+                        elif axname == "Z":
+                            Tform = f"Tz({sym})"
+                        else:
+                            base = axname[1:]
+                            Tform = f"T{base}(-{sym})  (since axis = {axname})"
+                        lines.append(f"Axis:  {axname}")
+                        lines.append(f"Trans: {Tform}")
+                    else:
+                        a = np.asarray(e.axis, dtype=float)
+                        n = float(np.linalg.norm(a))
+                        if n < 1e-12:
+                            ah = np.array([0.0, 0.0, 0.0])
+                        else:
+                            ah = a / n
+                        lines.append(
+                            f"Axis:  â = [{ah[0]:.4f}, {ah[1]:.4f}, {ah[2]:.4f}]"
+                        )
+                        lines.append(f"Trans: T(â * {sym})")
+
+                    lines.append("")
+
+        lines.append("=" * 70)
+        lines.append(
+            "Tip: For planar X–Z motion, set revolute joint axis to world Y (use Axis preset = Y)."
+        )
+        return "\n".join(lines)
 
 
 class GLRobotView(gl.GLViewWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent=parent)
-        self.setBackgroundColor((0, 0, 0, 255))
-        self.opts["distance"] = 2.5
-        self.opts["elevation"] = 20
-        self.opts["azimuth"] = 35
-
-        self._items: List[object] = []
+    def __init__(self):
+        super().__init__()
+        self.setCameraPosition(distance=1.2, elevation=25, azimuth=35)
+        self._frame_items = []
+        self._seg_items = []
+        self._ee_items = []
 
         grid = gl.GLGridItem()
-        grid.setSize(5, 5)
-        grid.setSpacing(0.2, 0.2)
+        grid.scale(0.1, 0.1, 0.1)
         self.addItem(grid)
-        self._items.append(grid)
 
-    def clear_dynamic(self):
-        # remove all except first grid
-        for it in self._items[1:]:
-            try:
-                self.removeItem(it)
-            except Exception:
-                pass
-        self._items = self._items[:1]
+    def clear_robot(self):
+        for it in self._frame_items + self._seg_items + self._ee_items:
+            self.removeItem(it)
+        self._frame_items.clear()
+        self._seg_items.clear()
+        self._ee_items.clear()
 
-    def draw_robot(
+    def draw_chain(
         self,
-        Ts_frames: List[np.ndarray],
+        Ts_global: List[np.ndarray],
         elements: List[Element],
-        ee_type: EndEffectorType,
+        end_effector: Optional[EndEffector],
     ):
-        self.clear_dynamic()
+        """
+        Draw segment geometry for each element between frame i and i+1.
+        - Link: gray box
+        - Revolute joint: red cylinder
+        - Prismatic joint: blue box
+        End effector is visual-only, attached to final frame.
+        """
+        self.clear_robot()
 
-        # Origins
-        origins = [T[:3, 3].copy() for T in Ts_frames]
+        # origins[k] corresponds to Ts_global[k]
+        origins = np.array([T[:3, 3] for T in Ts_global], dtype=float)
 
-        # ---- Draw LINKS between origins for Link elements only ----
-        link_w = 0.04
-        link_h = 0.02
-        link_color = (0.65, 0.65, 0.65, 1.0)
-
-        # Each element i maps frame i -> i+1
-        for i, e in enumerate(elements):
+        # -------- Draw LINKS (between origins) --------
+        for i in range(len(Ts_global) - 1):
+            e = elements[i]
             if not isinstance(e, Link):
-                continue
+                continue  # links only here
+
             p0 = origins[i]
             p1 = origins[i + 1]
             d = p1 - p0
@@ -608,232 +923,191 @@ class GLRobotView(gl.GLViewWidget):
             if L < 1e-6:
                 continue
 
-            md = meshdata_box((link_w, link_h, L))
+            md = center_meshdata_z(meshdata_box(size=(0.02, 0.02, L)))
+
             mesh = gl.GLMeshItem(
                 meshdata=md,
                 smooth=False,
                 drawFaces=True,
                 drawEdges=True,
-                color=link_color,
+                color=(0.65, 0.65, 0.65, 1.0),
             )
 
             R = rotation_matrix_from_z_to_vec(d)
             mid = 0.5 * (p0 + p1)
-            Tm = np.eye(4, dtype=float)
+            Tm = np.eye(4)
             Tm[:3, :3] = R
-            Tm[:3, 3] = mid
+            Tm[:3, 3] = mid  # - R @ np.array([0.0, 0.0, L / 2], dtype=float)
             mesh.setTransform(qmatrix_from_T(Tm))
 
             self.addItem(mesh)
-            self._items.append(mesh)
-
-        # ---- Draw JOINTS at frame origins (always visible) ----
+            self._seg_items.append(mesh)
+            # -------- Draw JOINTS (at joint origin, always visible) --------
+        joint_len = 0.08
         rev_radius = 0.02
-        rev_len = 0.08
-        pris_base = 0.08  # housing length
-        pris_w, pris_h = 0.05, 0.035
+        pris_w, pris_h = 0.05, 0.035  # cross-section
 
-        for i, e in enumerate(elements):
+        for i in range(len(elements)):
+            e = elements[i]
             if not isinstance(e, Joint):
                 continue
 
+            # Joint origin is frame i origin
             p0 = origins[i]
 
-            # compute joint axis in world using base (frame i) and T_mount
-            T_base = Ts_frames[i] @ e.T_mount
-            axis_local = unit(e.axis)
-            axis_w = T_base[:3, :3] @ axis_local
+            # Compute world axis using the joint base pose (before motion)
+            T_base = Ts_global[i] @ e.T_mount
+            a = np.asarray(e.axis, dtype=float)
+            a = a / (np.linalg.norm(a) + 1e-12)
+            axis_w = T_base[:3, :3] @ a
 
-            R_axis = rotation_matrix_from_z_to_vec(axis_w)
+            # Make transform that places a z-aligned mesh on the joint axis at p0
+            R = rotation_matrix_from_z_to_vec(axis_w)
+            mid = 0.5 * (p0 + p1)
+            Tm = np.eye(4)
+            Tm[:3, :3] = R
+            Tm[:3, 3] = p0  # p0 - R @ np.array([0.0, 0.0, L / 4], dtype=float)
 
-            if e.jtype == JointType.REVOLUTE:
-                md = meshdata_cylinder(rev_radius, rev_len, segments=26)
+            if e.joint_type == "revolute":
+                md = gl.MeshData.cylinder(
+                    rows=12, cols=24, radius=[rev_radius, rev_radius], length=joint_len
+                )
+                md = center_meshdata_z(md)
+
                 mesh = gl.GLMeshItem(
+                    meshdata=md,
+                    smooth=True,
+                    drawFaces=True,
+                    drawEdges=False,
+                    color=(0.85, 0.35, 0.35, 1.0),
+                )
+                mesh.setTransform(qmatrix_from_T(Tm))
+                self.addItem(mesh)
+                self._seg_items.append(mesh)
+
+            else:
+                # prismatic: show a housing always, and optionally an extension
+                # housing (fixed length)
+                T_base = Ts_global[i] @ e.T_mount
+                R_base = T_base[:3, :3]
+                p_base = T_base[:3, 3]
+
+                base_len = 0.08
+                md = meshdata_box(size=(pris_w, pris_h, base_len))
+                md = center_meshdata_z(md)
+
+                housing = gl.GLMeshItem(
                     meshdata=md,
                     smooth=False,
                     drawFaces=True,
                     drawEdges=True,
-                    color=(0.9, 0.2, 0.2, 1.0),
-                )
-                Tm = np.eye(4, dtype=float)
-                Tm[:3, :3] = R_axis
-                Tm[:3, 3] = p0
-                mesh.setTransform(qmatrix_from_T(Tm))
-                self.addItem(mesh)
-                self._items.append(mesh)
-
-            else:
-                # housing
-                housing_md = meshdata_box((pris_w, pris_h, pris_base))
-                housing = gl.GLMeshItem(
-                    meshdata=housing_md,
-                    smooth=False,
-                    drawFaces=True,
-                    drawEdges=True,
-                    color=(0.2, 0.45, 0.9, 1.0),
+                    color=(0.25, 0.35, 0.60, 1.0),
                 )
                 Th = np.eye(4, dtype=float)
-                Th[:3, :3] = R_axis
-                Th[:3, 3] = p0
-                housing.setTransform(qmatrix_from_T(Th))
-                self.addItem(housing)
-                self._items.append(housing)
+                Th[:3, :3] = R_base
+                Th[:3, 3] = p_base
 
-                # slider extends only in +axis direction visually
-                ext = max(0.0, float(e.q))
+                housing.setTransform(qmatrix_from_T(Th))
+
+                self.addItem(housing)
+                self._seg_items.append(housing)
+
+                # slider extension proportional to |q| (so you can "see" motion)
+                ext = max(0.0, float(e.q))  # only extend in +axis direction
+
                 if ext > 1e-6:
-                    slider_md = meshdata_box((pris_w * 0.75, pris_h * 0.75, ext))
+                    md_slider = center_meshdata_z(
+                        meshdata_box(size=(pris_w * 0.8, pris_h * 0.8, ext))
+                    )
+
                     slider = gl.GLMeshItem(
-                        meshdata=slider_md,
+                        meshdata=md_slider,
                         smooth=False,
                         drawFaces=True,
                         drawEdges=True,
                         color=(0.35, 0.55, 0.90, 1.0),
                     )
 
-                    # place slider in front of housing along +Z of joint-aligned frame
-                    offset = pris_base / 2.0 + ext / 2.0
-                    Ts = np.eye(4, dtype=float)
-                    Ts[:3, :3] = R_axis
-                    Ts[:3, 3] = p0 + R_axis @ np.array([0.0, 0.0, offset], dtype=float)
-                    slider.setTransform(qmatrix_from_T(Ts))
+                    Tslide = np.eye(4, dtype=float)
+                    Tslide[:3, :3] = R_base
 
+                    # slider is centered in its own +Z because of center_meshdata_z,
+                    # so place its CENTER in front of the housing:
+                    offset = (base_len / 2.0) + (ext / 2.0)
+
+                    Tslide[:3, 3] = p_base + R_base @ np.array(
+                        [0.0, 0.0, offset], dtype=float
+                    )
+
+                    slider.setTransform(qmatrix_from_T(Tslide))
                     self.addItem(slider)
-                    self._items.append(slider)
+                    self._seg_items.append(slider)
 
-        # ---- Draw frame triads ----
+        # frame triads
         axis_len = 0.06
-        for T in Ts_frames:
-            p = T[:3, 3]
-            R = T[:3, :3]
-            x = p + R[:, 0] * axis_len
-            y = p + R[:, 1] * axis_len
-            z = p + R[:, 2] * axis_len
+        for T in Ts_global:
+            o = origin_of(T)
+            R = axes_of(T)
+            x = o + axis_len * R[:, 0]
+            y = o + axis_len * R[:, 1]
+            z = o + axis_len * R[:, 2]
 
-            self._add_line(p, x, (1.0, 0.0, 0.0, 1.0))
-            self._add_line(p, y, (0.0, 1.0, 0.0, 1.0))
-            self._add_line(p, z, (0.3, 0.3, 1.0, 1.0))
+            lx = gl.GLLinePlotItem(pos=np.vstack([o, x]), width=3, color=(1, 0, 0, 1))
+            ly = gl.GLLinePlotItem(pos=np.vstack([o, y]), width=3, color=(0, 1, 0, 1))
+            lz = gl.GLLinePlotItem(pos=np.vstack([o, z]), width=3, color=(0, 0, 1, 1))
 
-        # ---- End effector (visual only) ----
-        if ee_type != EndEffectorType.NONE and len(Ts_frames) > 0:
-            Tee = Ts_frames[-1]
-            self._draw_ee(Tee, ee_type)
+            for it in (lx, ly, lz):
+                self.addItem(it)
+                self._frame_items.append(it)
 
-    def _add_line(self, p0, p1, color):
-        pts = np.vstack([p0, p1]).astype(float)
-        item = gl.GLLinePlotItem(pos=pts, color=color, width=2.0, antialias=True)
-        self.addItem(item)
-        self._items.append(item)
+        # end effector (visual only)
+        if end_effector is not None and len(Ts_global) > 0:
+            T_end = Ts_global[-1]
+            T_ee = T_end @ end_effector.T
 
-    def _draw_ee(self, Tee: np.ndarray, ee_type: EndEffectorType):
-        p = Tee[:3, 3]
-        R = Tee[:3, :3]
+            def add_mesh(md, color, Tlocal=np.eye(4), smooth=False, edges=True):
+                mesh = gl.GLMeshItem(
+                    meshdata=md,
+                    smooth=smooth,
+                    drawFaces=True,
+                    drawEdges=edges,
+                    color=color,
+                )
+                mesh.setTransform(qmatrix_from_T(T_ee @ Tlocal))
+                self.addItem(mesh)
+                self._ee_items.append(mesh)
 
-        if ee_type == EndEffectorType.FLANGE:
-            # ring-ish: approximate with a short fat cylinder
-            md = meshdata_cylinder(0.05, 0.015, segments=32)
-            mesh = gl.GLMeshItem(
-                meshdata=md,
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.85, 0.85, 0.85, 1.0),
-            )
-            Tm = np.eye(4, dtype=float)
-            Tm[:3, :3] = R
-            Tm[:3, 3] = p
-            mesh.setTransform(qmatrix_from_T(Tm))
-            self.addItem(mesh)
-            self._items.append(mesh)
+            ee = end_effector.ee_type
 
-        elif ee_type == EndEffectorType.SUCTION:
-            # disk + short stem
-            disk = gl.GLMeshItem(
-                meshdata=meshdata_cylinder(0.05, 0.01, 32),
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.2, 0.2, 0.2, 1.0),
-            )
-            stem = gl.GLMeshItem(
-                meshdata=meshdata_cylinder(0.01, 0.06, 20),
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.8, 0.8, 0.8, 1.0),
-            )
+            if ee == EEType.FLANGE:
+                md = gl.MeshData.cylinder(
+                    rows=8, cols=32, radius=[0.04, 0.04], length=0.02
+                )
+                add_mesh(md, (0.7, 0.7, 0.75, 1.0), smooth=True, edges=False)
 
-            Tdisk = np.eye(4, dtype=float)
-            Tdisk[:3, :3] = R
-            Tdisk[:3, 3] = p
-            disk.setTransform(qmatrix_from_T(Tdisk))
+            elif ee == EEType.SUCTION:
+                md = gl.MeshData.cylinder(
+                    rows=8, cols=32, radius=[0.03, 0.045], length=0.04
+                )
+                add_mesh(md, (0.2, 0.2, 0.2, 1.0), smooth=True, edges=False)
 
-            Tstem = np.eye(4, dtype=float)
-            Tstem[:3, :3] = R
-            Tstem[:3, 3] = p + R @ np.array([0, 0, 0.04], dtype=float)
-            stem.setTransform(qmatrix_from_T(Tstem))
+            elif ee == EEType.CLAW:
+                base = meshdata_box(size=(0.06, 0.05, 0.03))
+                add_mesh(base, (0.55, 0.55, 0.55, 1.0), edges=True)
 
-            self.addItem(disk)
-            self._items.append(disk)
-            self.addItem(stem)
-            self._items.append(stem)
+                finger = meshdata_box(size=(0.015, 0.015, 0.08))
+                Tl = np.eye(4)
+                Tl[:3, 3] = np.array([-0.025, 0.0, 0.03])
+                add_mesh(finger, (0.85, 0.75, 0.25, 1.0), Tlocal=Tl, edges=True)
 
-        elif ee_type == EndEffectorType.CLAW:
-            # two fingers
-            palm = gl.GLMeshItem(
-                meshdata=meshdata_box((0.08, 0.03, 0.03)),
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.9, 0.4, 0.1, 1.0),
-            )
-            finger = meshdata_box((0.015, 0.015, 0.08))
-            f1 = gl.GLMeshItem(
-                meshdata=finger,
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.95, 0.8, 0.1, 1.0),
-            )
-            f2 = gl.GLMeshItem(
-                meshdata=finger,
-                smooth=False,
-                drawFaces=True,
-                drawEdges=True,
-                color=(0.95, 0.8, 0.1, 1.0),
-            )
-
-            Tp = np.eye(4, dtype=float)
-            Tp[:3, :3] = R
-            Tp[:3, 3] = p
-            palm.setTransform(qmatrix_from_T(Tp))
-
-            Tf1 = np.eye(4, dtype=float)
-            Tf1[:3, :3] = R
-            Tf1[:3, 3] = p + R @ np.array([0.025, 0.0, 0.06], dtype=float)
-            f1.setTransform(qmatrix_from_T(Tf1))
-
-            Tf2 = np.eye(4, dtype=float)
-            Tf2[:3, :3] = R
-            Tf2[:3, 3] = p + R @ np.array([-0.025, 0.0, 0.06], dtype=float)
-            f2.setTransform(qmatrix_from_T(Tf2))
-
-            self.addItem(palm)
-            self._items.append(palm)
-            self.addItem(f1)
-            self._items.append(f1)
-            self.addItem(f2)
-            self._items.append(f2)
+                Tr = np.eye(4)
+                Tr[:3, 3] = np.array([+0.025, 0.0, 0.03])
+                add_mesh(finger, (0.85, 0.75, 0.25, 1.0), Tlocal=Tr, edges=True)
 
 
-# ============================
-# Main UI
-# ============================
-
-
-class AngleUnits(str, Enum):
-    RADIANS = "Radians"
-    DEGREES = "Degrees"
+# =========================
+# Main window
+# =========================
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -842,384 +1116,444 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(
             "Robot Frames Sandbox (Joints + Links + EE + Hybrid + Deg/Rad)"
         )
-        self.resize(1400, 800)
+        self.resize(1380, 760)
 
-        self.robot = RobotModel()
-        self.angle_units = AngleUnits.RADIANS
+        self.robot = RobotChain()
 
-        # start demo
-        self.robot.add_revolute(axis=(0, 0, 1))
-        self.robot.add_link(dx=0.3, dy=0, dz=0)
-        self.robot.add_revolute(axis=(1, 0, 0))
-        self.robot.add_link(dx=0.3, dy=0, dz=0)
-        self.robot.add_prismatic(axis=(0, 0, 1))
-        self.robot.add_link(dx=0.3, dy=0, dz=0)
+        # starter: J, L, J, L, J, L
+        self.robot.add_revolute_joint()
+        self.robot.add_link(dx=0.0, dy=0.0, dz=0.2)
+        self.robot.add_revolute_joint()
+        self.robot.add_link(dx=0.2)
+        self.robot.add_prismatic_joint()
+        self.robot.add_link(dx=0.2)
 
-        self.transforms_win = FrameTransformsWindow()
+        self.angle_unit = "rad"  # "rad" or "deg"
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central)
+        layout = QtWidgets.QHBoxLayout(central)
 
         # Left panel
         left = QtWidgets.QVBoxLayout()
-        root.addLayout(left, 0)
-
         self.list = QtWidgets.QListWidget()
-        self.list.setMinimumWidth(260)
+        self.btn_rev = QtWidgets.QPushButton("Add Revolute Joint")
+        self.btn_pri = QtWidgets.QPushButton("Add Prismatic Joint")
+        self.btn_link = QtWidgets.QPushButton("Add Link (Fixed)")
+        self.btn_rm = QtWidgets.QPushButton("Remove Selected")
+
         left.addWidget(QtWidgets.QLabel("Elements (Joint / Link)"))
         left.addWidget(self.list, 1)
+        left.addWidget(self.btn_rev)
+        left.addWidget(self.btn_pri)
+        left.addWidget(self.btn_link)
+        left.addWidget(self.btn_rm)
 
-        btns = QtWidgets.QVBoxLayout()
-        self.btn_add_rev = QtWidgets.QPushButton("Add Revolute Joint")
-        self.btn_add_pris = QtWidgets.QPushButton("Add Prismatic Joint")
-        self.btn_add_link = QtWidgets.QPushButton("Add Link (Fixed)")
-        self.btn_remove = QtWidgets.QPushButton("Remove Selected")
-        for b in (
-            self.btn_add_rev,
-            self.btn_add_pris,
-            self.btn_add_link,
-            self.btn_remove,
-        ):
-            btns.addWidget(b)
-        left.addLayout(btns)
-
+        # End effector controls
         left.addSpacing(12)
         left.addWidget(QtWidgets.QLabel("End Effector (visual)"))
         self.ee_combo = QtWidgets.QComboBox()
-        for t in EndEffectorType:
-            self.ee_combo.addItem(t.value)
-        left.addWidget(self.ee_combo)
+        self.ee_combo.addItems(
+            [EEType.FLANGE.value, EEType.SUCTION.value, EEType.CLAW.value]
+        )
         self.btn_set_ee = QtWidgets.QPushButton("Set End Effector")
         self.btn_clear_ee = QtWidgets.QPushButton("Clear End Effector")
+        left.addWidget(self.ee_combo)
         left.addWidget(self.btn_set_ee)
         left.addWidget(self.btn_clear_ee)
+
         left.addStretch(1)
 
         # Center view
         self.view = GLRobotView()
-        root.addWidget(self.view, 1)
 
-        # Right inspector
+        # Right panel
         right = QtWidgets.QVBoxLayout()
-        root.addLayout(right, 0)
-
         right.addWidget(QtWidgets.QLabel("Inspector"))
 
-        # angle units
-        row_units = QtWidgets.QHBoxLayout()
-        row_units.addWidget(QtWidgets.QLabel("Angle units:"))
-        self.units_combo = QtWidgets.QComboBox()
-        self.units_combo.addItem(AngleUnits.RADIANS.value)
-        self.units_combo.addItem(AngleUnits.DEGREES.value)
-        row_units.addWidget(self.units_combo, 1)
-        right.addLayout(row_units)
+        # Units toggle
+        unit_row = QtWidgets.QHBoxLayout()
+        unit_row.addWidget(QtWidgets.QLabel("Angle units:"))
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.addItems(["Radians", "Degrees"])
+        unit_row.addWidget(self.unit_combo, 1)
+        right.addLayout(unit_row)
 
-        # selected label
-        self.lbl_selected = QtWidgets.QLabel("Selected: (none)")
-        self.lbl_selected.setStyleSheet("padding: 6px 0; font-weight: 600;")
-        right.addWidget(self.lbl_selected)
+        self.lbl_kind = QtWidgets.QLabel("")
+        right.addWidget(self.lbl_kind)
 
-        self.lbl_joint_info = QtWidgets.QLabel("")
-        self.lbl_joint_info.setWordWrap(True)
-        self.lbl_joint_info.setStyleSheet("font-family: monospace;")
-        right.addWidget(self.lbl_joint_info)
+        self.stack = QtWidgets.QStackedWidget()
+        right.addWidget(self.stack, 1)
 
-        # axis preset + spinboxes
-        self.axis_preset = QtWidgets.QComboBox()
-        self.axis_preset.addItems(["Custom", "X", "Y", "Z"])
-        right.addWidget(QtWidgets.QLabel("Axis preset:"))
-        right.addWidget(self.axis_preset)
+        # ---- Joint editor page ----
+        joint_page = QtWidgets.QWidget()
+        jl = QtWidgets.QVBoxLayout(joint_page)
 
-        row_axis = QtWidgets.QHBoxLayout()
-        self.spin_ax = QtWidgets.QDoubleSpinBox()
-        self.spin_ax.setRange(-1, 1)
-        self.spin_ax.setDecimals(6)
-        self.spin_ay = QtWidgets.QDoubleSpinBox()
-        self.spin_ay.setRange(-1, 1)
-        self.spin_ay.setDecimals(6)
-        self.spin_az = QtWidgets.QDoubleSpinBox()
-        self.spin_az.setRange(-1, 1)
-        self.spin_az.setDecimals(6)
-        row_axis.addWidget(QtWidgets.QLabel("ax"))
-        row_axis.addWidget(self.spin_ax)
-        row_axis.addWidget(QtWidgets.QLabel("ay"))
-        row_axis.addWidget(self.spin_ay)
-        row_axis.addWidget(QtWidgets.QLabel("az"))
-        row_axis.addWidget(self.spin_az)
-        right.addLayout(row_axis)
+        self.joint_info = QtWidgets.QLabel("Select a joint")
+        jl.addWidget(self.joint_info)
 
-        # q slider
-        self.q_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.q_slider.setRange(-1800, 1800)
-        right.addWidget(self.q_slider)
+        axis_row = QtWidgets.QHBoxLayout()
+        axis_row.addWidget(QtWidgets.QLabel("Axis preset:"))
+        self.axis_mode = QtWidgets.QComboBox()
+        self.axis_mode.addItems(["Z", "Y", "X", "Custom"])
+        axis_row.addWidget(self.axis_mode, 1)
+        jl.addLayout(axis_row)
 
-        self.lbl_q = QtWidgets.QLabel("q = 0")
-        self.lbl_q.setStyleSheet("font-family: monospace;")
-        right.addWidget(self.lbl_q)
+        self.axis_x = QtWidgets.QDoubleSpinBox()
+        self.axis_y = QtWidgets.QDoubleSpinBox()
+        self.axis_z = QtWidgets.QDoubleSpinBox()
+        for sb in (self.axis_x, self.axis_y, self.axis_z):
+            sb.setRange(-1e6, 1e6)
+            sb.setDecimals(6)
+            sb.setSingleStep(0.1)
 
-        # mount matrix table
-        right.addWidget(QtWidgets.QLabel("Joint mount transform (fixed alignment)"))
-        self.tbl_mount = QtWidgets.QTableWidget(4, 4)
-        self.tbl_mount.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.tbl_mount.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
-        )
-        self.tbl_mount.horizontalHeader().setVisible(False)
-        self.tbl_mount.verticalHeader().setVisible(False)
-        self.tbl_mount.setStyleSheet("font-family: monospace; font-size: 13px;")
-        right.addWidget(self.tbl_mount, 1)
+        axis_vals = QtWidgets.QHBoxLayout()
+        axis_vals.addWidget(QtWidgets.QLabel("ax"))
+        axis_vals.addWidget(self.axis_x)
+        axis_vals.addWidget(QtWidgets.QLabel("ay"))
+        axis_vals.addWidget(self.axis_y)
+        axis_vals.addWidget(QtWidgets.QLabel("az"))
+        axis_vals.addWidget(self.axis_z)
+        jl.addLayout(axis_vals)
 
-        # SE3 validity indicator
-        self.lbl_se3 = QtWidgets.QLabel("SE(3) looks valid")
-        self.lbl_se3.setStyleSheet("color: #5fd35f; font-weight: 600; padding: 8px 0;")
-        right.addWidget(self.lbl_se3)
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(1000)
+        self.lbl_q = QtWidgets.QLabel("q = 0.0")
+        jl.addWidget(self.slider)
+        jl.addWidget(self.lbl_q)
 
-        # transforms window button
-        self.btn_open_tf = QtWidgets.QPushButton("Open Frame Transforms Window")
-        right.addWidget(self.btn_open_tf)
+        jl.addWidget(QtWidgets.QLabel("Joint mount transform (fixed alignment)"))
+        self.joint_mount = MatrixEditor()
+        jl.addWidget(self.joint_mount, 1)
+        self.joint_valid = QtWidgets.QLabel("")
+        jl.addWidget(self.joint_valid)
 
-        right.addStretch(1)
+        # ---- Link editor page ----
+        link_page = QtWidgets.QWidget()
+        ll = QtWidgets.QVBoxLayout(link_page)
 
-        # connections
-        self.btn_add_rev.clicked.connect(self.on_add_rev)
-        self.btn_add_pris.clicked.connect(self.on_add_pris)
-        self.btn_add_link.clicked.connect(self.on_add_link)
-        self.btn_remove.clicked.connect(self.on_remove)
+        self.link_info = QtWidgets.QLabel("Select a link")
+        ll.addWidget(self.link_info)
 
-        self.btn_set_ee.clicked.connect(self.on_set_ee)
-        self.btn_clear_ee.clicked.connect(self.on_clear_ee)
+        ll.addWidget(QtWidgets.QLabel("Link transform (fixed) — use this for L-shapes"))
+        self.link_mat = MatrixEditor()
+        ll.addWidget(self.link_mat, 1)
+        self.link_valid = QtWidgets.QLabel("")
+        ll.addWidget(self.link_valid)
 
-        self.list.currentRowChanged.connect(self.on_select)
-        self.axis_preset.currentIndexChanged.connect(self.on_axis_preset)
-        self.spin_ax.valueChanged.connect(self.on_axis_changed)
-        self.spin_ay.valueChanged.connect(self.on_axis_changed)
-        self.spin_az.valueChanged.connect(self.on_axis_changed)
+        self.stack.addWidget(joint_page)  # index 0
+        self.stack.addWidget(link_page)  # index 1
 
-        self.q_slider.valueChanged.connect(self.on_q_changed)
-        self.units_combo.currentIndexChanged.connect(self.on_units_changed)
+        layout.addLayout(left, 1)
+        layout.addWidget(self.view, 2)
+        layout.addLayout(right, 1)
 
-        self.btn_open_tf.clicked.connect(self.on_open_transforms)
+        # Matrices window
+        self.mats_win = MatricesWindow(self)
+        self.mats_win.show()
 
-        # init
+        # signals
+        self.btn_rev.clicked.connect(self.add_rev)
+        self.btn_pri.clicked.connect(self.add_pri)
+        self.btn_link.clicked.connect(self.add_link)
+        self.btn_rm.clicked.connect(self.remove_selected)
+        self.list.currentRowChanged.connect(self.select_element)
+
+        self.slider.valueChanged.connect(self.slider_changed)
+
+        self.axis_mode.currentIndexChanged.connect(self.axis_mode_changed)
+        self.axis_x.valueChanged.connect(self.axis_values_changed)
+        self.axis_y.valueChanged.connect(self.axis_values_changed)
+        self.axis_z.valueChanged.connect(self.axis_values_changed)
+
+        self.joint_mount.matrixChanged.connect(self.joint_mount_edited)
+        self.link_mat.matrixChanged.connect(self.link_matrix_edited)
+
+        self.btn_set_ee.clicked.connect(self.set_end_effector)
+        self.btn_clear_ee.clicked.connect(self.clear_end_effector)
+
+        self.unit_combo.currentIndexChanged.connect(self.unit_changed)
+
+        self._block = False
         self.refresh_list()
         self.list.setCurrentRow(0)
         self.update_view()
+
+    # ---------- Units helpers ----------
+
+    def q_to_display(self, q_rad: float) -> float:
+        if self.angle_unit == "deg":
+            return math.degrees(q_rad)
+        return q_rad
+
+    def format_q_label_joint(self, j: Joint) -> str:
+        if j.joint_type == "prismatic":
+            return f"q = {j.q:.5f} m"
+        # revolute
+        q_rad = float(j.q)
+        if self.angle_unit == "deg":
+            return f"q = {math.degrees(q_rad):.3f} deg  ({q_rad:.5f} rad)"
+        return f"q = {q_rad:.5f} rad"
+
+    def unit_changed(self, _idx: int):
+        self.angle_unit = "deg" if self.unit_combo.currentText() == "Degrees" else "rad"
+        e = self.current_element()
+        if isinstance(e, Joint):
+            self.lbl_q.setText(self.format_q_label_joint(e))
+        self.update_view()
+
+    # ---------- Helpers ----------
 
     def refresh_list(self):
         self.list.clear()
         for e in self.robot.elements:
             self.list.addItem(e.name)
 
-    def selected_element(self) -> Optional[Element]:
-        idx = self.list.currentRow()
-        if 0 <= idx < len(self.robot.elements):
-            return self.robot.elements[idx]
+    def current_index(self) -> int:
+        return self.list.currentRow()
+
+    def current_element(self) -> Optional[Element]:
+        i = self.current_index()
+        if 0 <= i < len(self.robot.elements):
+            return self.robot.elements[i]
         return None
 
     def update_view(self):
-        Ts_frames, _ = self.robot.fk_frames()
-        self.view.draw_robot(Ts_frames, self.robot.elements, self.robot.ee_type)
+        Ts = self.robot.fk_all()
+        self.view.draw_chain(Ts, self.robot.elements, self.robot.end_effector)
 
-        # update transforms window (if open)
-        self.transforms_win.update_from_robot(
-            self.robot, angle_units_deg=(self.angle_units == AngleUnits.DEGREES)
+        locals_list = [e.local_T() for e in self.robot.elements]
+        self.mats_win.set_transforms(
+            self.robot.elements, locals_list, Ts, self.angle_unit
         )
 
-    def update_inspector(self):
-        e = self.selected_element()
-        if e is None:
-            self.lbl_selected.setText("Selected: (none)")
-            self.lbl_joint_info.setText("")
+    def set_slider_from_q(self, j: Joint):
+        t = (j.q - j.q_min) / (j.q_max - j.q_min + 1e-12)
+        self.slider.setValue(int(np.clip(t, 0, 1) * 1000))
+
+    def set_q_from_slider(self, j: Joint, v: int):
+        t = v / 1000.0
+        j.q = j.q_min + t * (j.q_max - j.q_min)
+
+    def _set_joint_axis(self, j: Joint, axis_vec: np.ndarray):
+        axis_vec = np.asarray(axis_vec, dtype=float)
+        n = float(np.linalg.norm(axis_vec))
+        if n < 1e-12:
             return
+        j.axis = axis_vec / n
 
-        if isinstance(e, Joint):
-            self.lbl_selected.setText("Selected: JOINT")
-            axis = unit(e.axis)
-            self.spin_ax.blockSignals(True)
-            self.spin_ay.blockSignals(True)
-            self.spin_az.blockSignals(True)
-            self.spin_ax.setValue(float(axis[0]))
-            self.spin_ay.setValue(float(axis[1]))
-            self.spin_az.setValue(float(axis[2]))
-            self.spin_ax.blockSignals(False)
-            self.spin_ay.blockSignals(False)
-            self.spin_az.blockSignals(False)
+    # ---------- Actions ----------
 
-            axis_label = f"[{axis[0]:.3f},{axis[1]:.3f},{axis[2]:.3f}]"
-            self.lbl_joint_info.setText(
-                f"{e.name} | {e.jtype.value} | axis={axis_label}"
-            )
-
-            # slider mapping
-            if e.jtype == JointType.REVOLUTE:
-                # internal radians; slider shows deg or rad
-                if self.angle_units == AngleUnits.DEGREES:
-                    val = int(round(math.degrees(e.q) * 10))
-                    self.lbl_q.setText(f"q = {math.degrees(e.q):.5f} deg")
-                else:
-                    val = int(round(e.q * 1000))
-                    self.lbl_q.setText(f"q = {e.q:.5f} rad")
-                self.q_slider.blockSignals(True)
-                (
-                    self.q_slider.setRange(-1800, 1800)
-                    if self.angle_units == AngleUnits.DEGREES
-                    else self.q_slider.setRange(-4000, 4000)
-                )
-                self.q_slider.setValue(val)
-                self.q_slider.blockSignals(False)
-            else:
-                # prismatic in meters
-                self.q_slider.blockSignals(True)
-                self.q_slider.setRange(-500, 500)  # +/-0.5m
-                self.q_slider.setValue(int(round(e.q * 1000)))
-                self.q_slider.blockSignals(False)
-                self.lbl_q.setText(f"q = {e.q:.5f} m")
-
-            # mount matrix
-            Tm = e.T_mount
-            self._fill_table(self.tbl_mount, Tm)
-
-            ok = se3_valid(Tm)
-            self.lbl_se3.setText("SE(3) looks valid" if ok else "SE(3) invalid")
-            self.lbl_se3.setStyleSheet(
-                "color: #5fd35f; font-weight: 600; padding: 8px 0;"
-                if ok
-                else "color: #ff5555; font-weight: 600; padding: 8px 0;"
-            )
-        else:
-            self.lbl_selected.setText("Selected: LINK")
-            link: Link = e  # type: ignore
-            self.lbl_joint_info.setText(
-                f"{link.name} | fixed | dx,dy,dz=[{link.dx:.3f},{link.dy:.3f},{link.dz:.3f}]"
-            )
-            self.lbl_q.setText("q = (n/a)")
-            self._fill_table(self.tbl_mount, np.eye(4, dtype=float))
-            self.lbl_se3.setText("SE(3) looks valid")
-            self.lbl_se3.setStyleSheet(
-                "color: #5fd35f; font-weight: 600; padding: 8px 0;"
-            )
-
-    def _fill_table(self, tbl: QtWidgets.QTableWidget, T: np.ndarray):
-        for r in range(4):
-            for c in range(4):
-                it = QtWidgets.QTableWidgetItem(f"{T[r, c]: .6f}")
-                it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-                tbl.setItem(r, c, it)
-        tbl.resizeColumnsToContents()
-        tbl.resizeRowsToContents()
-
-    # ---- callbacks ----
-
-    def on_add_rev(self):
-        self.robot.add_revolute(axis=(0, 0, 1))
+    def add_rev(self):
+        self.robot.add_revolute_joint()
         self.refresh_list()
         self.list.setCurrentRow(len(self.robot.elements) - 1)
         self.update_view()
 
-    def on_add_pris(self):
-        self.robot.add_prismatic(axis=(0, 0, 1))
+    def add_pri(self):
+        self.robot.add_prismatic_joint()
         self.refresh_list()
         self.list.setCurrentRow(len(self.robot.elements) - 1)
         self.update_view()
 
-    def on_add_link(self):
-        self.robot.add_link(dx=0.3, dy=0.0, dz=0.0)
+    def add_link(self):
+        self.robot.add_link(dx=0.2, dy=0.0, dz=0.0)
         self.refresh_list()
         self.list.setCurrentRow(len(self.robot.elements) - 1)
         self.update_view()
 
-    def on_remove(self):
-        idx = self.list.currentRow()
-        if idx < 0:
-            return
-        self.robot.remove_at(idx)
+    def remove_selected(self):
+        idx = self.current_index()
+        self.robot.remove(idx)
         self.refresh_list()
         self.list.setCurrentRow(min(idx, len(self.robot.elements) - 1))
         self.update_view()
 
-    def on_set_ee(self):
+    # ---------- End Effector ----------
+
+    def set_end_effector(self):
         txt = self.ee_combo.currentText()
-        self.robot.ee_type = (
-            EndEffectorType(txt)
-            if txt in [t.value for t in EndEffectorType]
-            else EndEffectorType.NONE
-        )
-        self.update_view()
+        if self.robot.end_effector is None:
+            self.robot.end_effector = EndEffector(EEType.FLANGE, np.eye(4))
 
-    def on_clear_ee(self):
-        self.robot.ee_type = EndEffectorType.NONE
-        self.ee_combo.setCurrentText(EndEffectorType.NONE.value)
-        self.update_view()
-
-    def on_select(self, idx: int):
-        self.update_inspector()
-
-    def on_axis_preset(self, _):
-        e = self.selected_element()
-        if not isinstance(e, Joint):
-            return
-        preset = self.axis_preset.currentText()
-        if preset == "X":
-            e.axis = np.array([1.0, 0.0, 0.0], dtype=float)
-        elif preset == "Y":
-            e.axis = np.array([0.0, 1.0, 0.0], dtype=float)
-        elif preset == "Z":
-            e.axis = np.array([0.0, 0.0, 1.0], dtype=float)
-        # "Custom" does nothing
-        self.update_inspector()
-        self.update_view()
-
-    def on_axis_changed(self, _):
-        e = self.selected_element()
-        if not isinstance(e, Joint):
-            return
-        a = np.array(
-            [self.spin_ax.value(), self.spin_ay.value(), self.spin_az.value()],
-            dtype=float,
-        )
-        e.axis = unit(a)
-        self.axis_preset.blockSignals(True)
-        self.axis_preset.setCurrentText("Custom")
-        self.axis_preset.blockSignals(False)
-        self.update_inspector()
-        self.update_view()
-
-    def on_q_changed(self, v: int):
-        e = self.selected_element()
-        if not isinstance(e, Joint):
-            return
-        if e.jtype == JointType.REVOLUTE:
-            if self.angle_units == AngleUnits.DEGREES:
-                deg = v / 10.0
-                e.q = math.radians(deg)
-            else:
-                e.q = v / 1000.0
+        if txt == EEType.FLANGE.value:
+            self.robot.end_effector.ee_type = EEType.FLANGE
+        elif txt == EEType.SUCTION.value:
+            self.robot.end_effector.ee_type = EEType.SUCTION
         else:
-            e.q = v / 1000.0  # meters
-        self.update_inspector()
+            self.robot.end_effector.ee_type = EEType.CLAW
+
         self.update_view()
 
-    def on_units_changed(self, _):
-        self.angle_units = AngleUnits(self.units_combo.currentText())
-        self.update_inspector()
+    def clear_end_effector(self):
+        self.robot.end_effector = None
         self.update_view()
 
-    def on_open_transforms(self):
-        self.transforms_win.show()
-        self.transforms_win.raise_()
+    # ---------- Selection ----------
 
+    def select_element(self, _idx: int):
+        e = self.current_element()
+        if e is None:
+            return
 
-# ============================
-# Main
-# ============================
+        self._block = True
+
+        if isinstance(e, Joint):
+            self.lbl_kind.setText("Selected: JOINT")
+            self.stack.setCurrentIndex(0)
+
+            self.joint_info.setText(
+                f"{e.name} | {e.joint_type} | axis={e.axis.tolist()}"
+            )
+            self.set_slider_from_q(e)
+            self.lbl_q.setText(self.format_q_label_joint(e))
+
+            ax, ay, az = map(float, e.axis.tolist())
+            self.axis_x.setValue(ax)
+            self.axis_y.setValue(ay)
+            self.axis_z.setValue(az)
+
+            if np.allclose(e.axis, [1, 0, 0], atol=1e-6):
+                self.axis_mode.setCurrentText("X")
+            elif np.allclose(e.axis, [0, 1, 0], atol=1e-6):
+                self.axis_mode.setCurrentText("Y")
+            elif np.allclose(e.axis, [0, 0, 1], atol=1e-6):
+                self.axis_mode.setCurrentText("Z")
+            else:
+                self.axis_mode.setCurrentText("Custom")
+
+            self.joint_mount.set_matrix(e.T_mount)
+            self.joint_valid.setText("")
+
+        else:
+            self.lbl_kind.setText("Selected: LINK")
+            self.stack.setCurrentIndex(1)
+
+            self.link_info.setText(f"{e.name} (fixed link transform)")
+            self.link_mat.set_matrix(e.T)
+            self.link_valid.setText("")
+
+        self._block = False
+
+    # ---------- Joint editor callbacks ----------
+
+    def slider_changed(self, v: int):
+        if self._block:
+            return
+        e = self.current_element()
+        if not isinstance(e, Joint):
+            return
+
+        self.set_q_from_slider(e, v)
+        self.lbl_q.setText(self.format_q_label_joint(e))
+        self.update_view()
+
+    def axis_mode_changed(self, _idx: int):
+        if self._block:
+            return
+        e = self.current_element()
+        if not isinstance(e, Joint):
+            return
+
+        mode = self.axis_mode.currentText()
+        if mode == "X":
+            self._set_joint_axis(e, np.array([1.0, 0.0, 0.0]))
+        elif mode == "Y":
+            self._set_joint_axis(e, np.array([0.0, 1.0, 0.0]))
+        elif mode == "Z":
+            self._set_joint_axis(e, np.array([0.0, 0.0, 1.0]))
+        else:
+            axis = np.array(
+                [self.axis_x.value(), self.axis_y.value(), self.axis_z.value()],
+                dtype=float,
+            )
+            self._set_joint_axis(e, axis)
+
+        self._block = True
+        self.joint_info.setText(f"{e.name} | {e.joint_type} | axis={e.axis.tolist()}")
+        self._block = False
+        self.update_view()
+
+    def axis_values_changed(self, *_args):
+        if self._block:
+            return
+        e = self.current_element()
+        if not isinstance(e, Joint):
+            return
+
+        axis = np.array(
+            [self.axis_x.value(), self.axis_y.value(), self.axis_z.value()], dtype=float
+        )
+        if float(np.linalg.norm(axis)) < 1e-12:
+            return
+
+        if self.axis_mode.currentText() != "Custom":
+            self._block = True
+            self.axis_mode.setCurrentText("Custom")
+            self._block = False
+
+        self._set_joint_axis(e, axis)
+
+        self._block = True
+        self.joint_info.setText(f"{e.name} | {e.joint_type} | axis={e.axis.tolist()}")
+        self._block = False
+        self.update_view()
+
+    def joint_mount_edited(self, T_user: np.ndarray):
+        if self._block:
+            return
+        e = self.current_element()
+        if not isinstance(e, Joint):
+            return
+
+        T = T_user.copy()
+        T[3, :] = np.array([0, 0, 0, 1], dtype=float)
+        T[:3, :3] = project_to_so3(T[:3, :3])
+
+        e.T_mount = T
+
+        self._block = True
+        self.joint_mount.set_matrix(e.T_mount)
+        self.joint_valid.setText(
+            "✅ SE(3) looks valid"
+            if is_valid_transform(T)
+            else "⚠️ Rotation projected; last row forced"
+        )
+        self._block = False
+
+        self.update_view()
+
+    # ---------- Link editor callbacks ----------
+
+    def link_matrix_edited(self, T_user: np.ndarray):
+        if self._block:
+            return
+        e = self.current_element()
+        if not isinstance(e, Link):
+            return
+
+        T = T_user.copy()
+        T[3, :] = np.array([0, 0, 0, 1], dtype=float)
+        T[:3, :3] = project_to_so3(T[:3, :3])
+
+        e.T = T
+
+        self._block = True
+        self.link_mat.set_matrix(e.T)
+        self.link_valid.setText(
+            "✅ SE(3) looks valid"
+            if is_valid_transform(T)
+            else "⚠️ Rotation projected; last row forced"
+        )
+        self._block = False
+
+        self.update_view()
 
 
 def main():
-    pg.setConfigOptions(antialias=True)
     app = QtWidgets.QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
